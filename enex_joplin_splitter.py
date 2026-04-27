@@ -11,6 +11,11 @@ from datetime import datetime
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
+try:
+    from ftfy import fix_text as _ftfy_fix_text
+except Exception:
+    _ftfy_fix_text = None
+
 ELLIPSIS = '…'
 MAX_TITLE_LEN = 80
 UNTITLED_TITLES = {'無題のノート', 'Untitled Note'}
@@ -21,13 +26,19 @@ HTML_LIKE_TAGS = {
     'video', 'audio', 'source', 'picture', 'svg', 'math', 'pre', 'code', 'figure',
     'figcaption', 'details', 'summary'
 }
-WEB_CLIP_HINTS = {'clip', 'clipped', 'webclip', 'web clip', 'web.clip', 'article', 'page', 'url'}
+WEB_CLIP_HINTS = {'clip', 'clipped', 'webclip', 'web clip', 'article', 'page', 'url'}
 BLOCK_BREAK_TAGS = {'div', 'p', 'li', 'tr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'br'}
-NOTE_LINK_RE = re.compile(r'<a\b[^>]*\bhref\s*=\s*(["'])evernote:[^"']*\1', re.IGNORECASE)
+NOTE_LINK_RE = re.compile(r"<a\b[^>]*\bhref\s*=\s*([\"'])evernote:[^\"']*\1", re.IGNORECASE)
 WEB_CLIP_BODY_PATTERNS = [
-    re.compile(r'<div\b[^>]*\bstyle\s*=\s*(["'])[^"']*-evernote-webclip:true[^"']*\1', re.IGNORECASE),
-    re.compile(r'<div\b[^>]*\bstyle\s*=\s*(["'])[^"']*--en-clipped-content:[^"']*\1', re.IGNORECASE),
+    re.compile(r"<div\b[^>]*\bstyle\s*=\s*([\"'])[^\"']*-evernote-webclip:true[^\"']*\1", re.IGNORECASE),
+    re.compile(r"<div\b[^>]*\bstyle\s*=\s*([\"'])[^\"']*--en-clipped-content:[^\"']*\1", re.IGNORECASE),
 ]
+WEB_CLIP_SOURCE_APPLICATIONS = {
+    'webclipper.evernote',
+    'WebClipper for Firefox',
+    'WebClipper',
+}
+CDATA_RE = re.compile(r'<!\[CDATA\[(.*?)\]\]>', re.DOTALL)
 
 
 def configure_stdio_utf8():
@@ -48,8 +59,30 @@ def collapse_ws(s: str) -> str:
     return re.sub(r'\s+', ' ', s or '').strip()
 
 
-def truncate_title(s: str, limit: int = MAX_TITLE_LEN) -> str:
+
+
+def clean_title_text(s: str) -> str:
+    s = html.unescape(s or '')
+    if _ftfy_fix_text is not None:
+        try:
+            s = _ftfy_fix_text(s, fix_entities=False)
+        except Exception:
+            pass
+    try:
+        s = s.encode('cp932', errors='ignore').decode('cp932')
+    except Exception:
+        pass
+    s = re.sub(r'D\?+', '', s)
+    s = s.replace('\ufffd', ' ')
+    s = re.sub(r'[#\uFF03]+(?:\s*\ufffd\s*[A-Za-z0-9?]+)+', ' ', s)
+    s = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', ' ', s)
     s = collapse_ws(s)
+    if re.fullmatch(r'[?#\-_.…\s]+', s or ''):
+        return 'Untitled'
+    return s or 'Untitled'
+
+def truncate_title(s: str, limit: int = MAX_TITLE_LEN) -> str:
+    s = clean_title_text(s)
     if not s:
         return 'Untitled'
     if len(s) <= limit:
@@ -91,6 +124,23 @@ def get_child(elem, name):
 
 def get_children(elem, name):
     return [c for c in list(elem) if strip_ns(c.tag) == name]
+
+
+def extract_content_enml(note_xml: str) -> str:
+    m = re.search(r'<content>(.*?)</content>', note_xml, flags=re.DOTALL | re.IGNORECASE)
+    if not m:
+        return ''
+    inner = m.group(1)
+    c = CDATA_RE.search(inner)
+    if c:
+        return c.group(1)
+    return html.unescape(inner)
+
+
+def replace_content_enml(note_xml: str, new_enml: str) -> str:
+    safe_cdata = new_enml.replace(']]>', ']]]]><![CDATA[>')
+    replacement = f'<content><![CDATA[{safe_cdata}]]></content>'
+    return re.sub(r'<content>.*?</content>', lambda _m: replacement, note_xml, count=1, flags=re.DOTALL | re.IGNORECASE)
 
 
 def enml_first_plain_line(enml: str) -> str:
@@ -142,19 +192,18 @@ def enml_first_plain_line(enml: str) -> str:
     return truncate_title(line) if line else 'Untitled'
 
 
-def retitle_if_needed(note_elem):
+def retitle_if_needed(note_elem, note_xml: str):
     title_elem = get_child(note_elem, 'title')
     current = (title_elem.text or '').strip() if title_elem is not None and title_elem.text else ''
     if current in UNTITLED_TITLES:
-        content_elem = get_child(note_elem, 'content')
-        enml = content_elem.text or '' if content_elem is not None else ''
+        enml = extract_content_enml(note_xml)
         new_title = enml_first_plain_line(enml)
         if title_elem is None:
             title_elem = ET.Element('title')
             note_elem.insert(0, title_elem)
-        title_elem.text = new_title
+        title_elem.text = clean_title_text(new_title)
         return True, current, new_title
-    return False, current, current
+    return False, clean_title_text(current), clean_title_text(current)
 
 
 def normalize_resources(note_elem):
@@ -183,16 +232,30 @@ def normalize_resources(note_elem):
     return changed, renamed
 
 
-def is_web_clip_or_html_heavy(note_elem):
-    content = get_child(note_elem, 'content')
-    enml = (content.text or '') if content is not None else ''
+def is_web_clip_or_html_heavy(note_elem, enml: str, source_url_implies_html: bool = True):
     lowered = enml.lower()
 
     attrs = get_child(note_elem, 'note-attributes')
     source_url = collapse_ws(getattr(get_child(attrs, 'source-url'), 'text', '') if attrs is not None else '')
     source = collapse_ws(getattr(get_child(attrs, 'source'), 'text', '') if attrs is not None else '')
-    if source_url:
+    source_application = collapse_ws(getattr(get_child(attrs, 'source-application'), 'text', '') if attrs is not None else '')
+
+    body_reasons = ['body:-evernote-webclip:true', 'body:--en-clipped-content']
+    for pattern, reason in zip(WEB_CLIP_BODY_PATTERNS, body_reasons):
+        if pattern.search(enml):
+            return True, reason
+
+    if source.startswith('web.clip'):
+        return True, f'source={source}'
+    if source_application in WEB_CLIP_SOURCE_APPLICATIONS:
+        return True, f'source-application={source_application}'
+
+    if source_url and source_url_implies_html:
         return True, 'source-url'
+
+    if not source_url_implies_html:
+        return False, 'markdown-friendly'
+
     if source and any(k in source.lower() for k in WEB_CLIP_HINTS):
         return True, f'source={source}'
 
@@ -226,13 +289,16 @@ def is_web_clip_or_html_heavy(note_elem):
         reasons.append(f'media_tags={media_count}')
 
     if score >= 3:
-        return True, ';'.join(reasons) or f'html_score={score}'
+        return True, ';'.join(reasons)
     return False, 'markdown-friendly'
 
 
-def write_note(note_elem, fh):
-    fh.write(ET.tostring(note_elem, encoding='unicode'))
-    fh.write('\n')
+def serialize_note_preserving_content(note_elem, original_note_xml: str, preserve_content: bool = True) -> str:
+    xml_text = ET.tostring(note_elem, encoding='unicode')
+    if not preserve_content:
+        return xml_text
+    original_enml = extract_content_enml(original_note_xml)
+    return replace_content_enml(xml_text, original_enml)
 
 
 def expand_inputs(patterns, recursive=False):
@@ -246,14 +312,17 @@ def expand_inputs(patterns, recursive=False):
         for p in matches:
             path = Path(p)
             if path.is_file() and path.suffix.lower() == '.enex':
-                key = str(path.resolve()) if path.exists() else str(path)
+                try:
+                    key = str(path.resolve())
+                except Exception:
+                    key = str(path)
                 if key not in seen:
                     seen.add(key)
                     results.append(path)
     return sorted(results)
 
 
-def process_file_streaming(input_path: Path, output_dir: Path, csv_writer=None):
+def process_file_streaming(input_path: Path, output_dir: Path, csv_writer=None, source_url_implies_html: bool = True):
     base = input_path.stem
     md_path = output_dir / f'{base}_md.enex'
     html_path = output_dir / f'{base}_html.enex'
@@ -285,6 +354,7 @@ def process_file_streaming(input_path: Path, output_dir: Path, csv_writer=None):
                 continue
 
             if elem is root:
+                stack.pop()
                 continue
 
             tag = strip_ns(elem.tag)
@@ -298,9 +368,12 @@ def process_file_streaming(input_path: Path, output_dir: Path, csv_writer=None):
 
             if tag == 'note':
                 note_index += 1
+                original_note_xml = ET.tostring(elem, encoding='unicode')
+                original_enml = extract_content_enml(original_note_xml)
+
                 title_elem = get_child(elem, 'title')
                 original_title = (title_elem.text or '').strip() if title_elem is not None and title_elem.text else ''
-                was_retitled, _, final_title = retitle_if_needed(elem)
+                was_retitled, _, final_title = retitle_if_needed(elem, original_note_xml)
                 if was_retitled:
                     summary['retitled'] += 1
 
@@ -308,19 +381,19 @@ def process_file_streaming(input_path: Path, output_dir: Path, csv_writer=None):
                 if resources_changed:
                     summary['resource_filenames_fixed'] += 1
 
-                content_elem = get_child(elem, 'content')
-                enml = content_elem.text or '' if content_elem is not None else ''
-                enml_lower = enml.lower()
-                has_encrypted = '<en-crypt ' in enml_lower
-                has_note_link = bool(NOTE_LINK_RE.search(enml))
+                has_encrypted = '<en-crypt ' in original_enml.lower()
+                has_note_link = bool(NOTE_LINK_RE.search(original_enml))
 
-                is_html, reason = is_web_clip_or_html_heavy(elem)
+                is_html, reason = is_web_clip_or_html_heavy(elem, original_enml, source_url_implies_html=source_url_implies_html)
                 bucket = 'html' if is_html else 'md'
+                note_xml_out = serialize_note_preserving_content(elem, original_note_xml, preserve_content=True)
                 if is_html:
-                    write_note(elem, html_fh)
+                    html_fh.write(note_xml_out)
+                    html_fh.write('\n')
                     summary['html_notes'] += 1
                 else:
-                    write_note(elem, md_fh)
+                    md_fh.write(note_xml_out)
+                    md_fh.write('\n')
                     summary['md_notes'] += 1
                 summary['total_notes'] += 1
 
@@ -341,7 +414,11 @@ def process_file_streaming(input_path: Path, output_dir: Path, csv_writer=None):
 
                 elem.clear()
                 if len(stack) >= 2:
-                    stack[-2].remove(elem)
+                    parent = stack[-2]
+                    try:
+                        parent.remove(elem)
+                    except ValueError:
+                        pass
 
             stack.pop()
 
@@ -372,6 +449,7 @@ def main():
     p.add_argument('-o', '--output-dir', default='.', help='Output directory')
     p.add_argument('--recursive', action='store_true', help='Enable recursive wildcard expansion for patterns like **/*.enex')
     p.add_argument('--csv-log', default=None, help='CSV log file path (default: output_dir/enex_split_log_YYYYmmdd_HHMMSS.csv)')
+    p.add_argument('--webclip-only-html', action='store_true', help='Treat only explicit web clips as HTML; notes with source-url alone stay in Markdown unless other HTML-heavy rules match.')
     args = p.parse_args()
 
     output_dir = Path(args.output_dir).expanduser()
@@ -410,7 +488,12 @@ def main():
         ])
 
         for input_path in input_files:
-            summary = process_file_streaming(input_path, output_dir, csv_writer=writer)
+            summary = process_file_streaming(
+                input_path,
+                output_dir,
+                csv_writer=writer,
+                source_url_implies_html=not args.webclip_only_html,
+            )
             totals['files'] += 1
             totals['notes'] += summary['total_notes']
             totals['retitled'] += summary['retitled']
